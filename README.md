@@ -63,8 +63,29 @@ Backtest collected data:
 
 ```bash
 python3 -m divergence_backtest.cli work/binance-dogeusdt-bbo.csv \
-  --report outputs/binance-backtest-report.json
+  --report outputs/binance-backtest-report.json \
+  --signals outputs/binance-signal-marks.csv
 ```
+
+Every independent tail event receives an `event_id`. The signal CSV records its
+full lifecycle:
+
+```text
+detected   basis entered its historical tail
+candidate  spread and spot-lead hard conditions passed
+confirmed  futures began closing the divergence; trade signal is valid
+entry      simulated futures entry after configured latency
+rejected   condition failed, with the exact reason recorded
+exit_*     target, stop, or time exit
+```
+
+Only `confirmed` marks are actionable trade signals. `detected` marks are
+observations, not permission to trade.
+
+A confirmed signal is allowed only when convergence is primarily repaired by
+futures rather than spot retreating, and when the remaining expected move after
+entry latency exceeds round-trip fees, slippage, and the configured safety
+margin. Failed conditions are exported with their exact rejection reason.
 
 Generate synthetic data and run a backtest:
 

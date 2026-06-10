@@ -42,8 +42,10 @@ Only investigate events satisfying all conditions:
 2. The divergence-forming price move is led by spot.
 3. Both spot and futures quoted spreads remain below a fixed safety limit.
 4. The divergence persists and futures begins closing it before entry.
-5. Entry occurs after a simulated execution delay at the futures bid or ask.
-6. Remaining expected movement exceeds fees, slippage, and a safety margin.
+5. Futures contributes the configured minimum share of the observed convergence;
+   spot retreat alone cannot confirm a signal.
+6. Entry occurs after a simulated execution delay at the futures bid or ask.
+7. Remaining expected movement exceeds fees, slippage, and a safety margin.
 
 Exit on:
 
@@ -76,4 +78,3 @@ Null: randomized event directions and timestamps
 
 The strategy earns further development only when Model A beats both alternatives
 on untouched data.
-

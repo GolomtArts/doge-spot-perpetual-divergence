@@ -40,6 +40,7 @@ class BacktestConfig:
     spot_lead_ratio: float = 1.5
     minimum_spot_move_bps: float = 4.0
     confirmation_fraction: float = 0.15
+    minimum_futures_repair_share: float = 0.60
     max_confirmation_ms: int = 5 * 60 * 1000
     entry_latency_ms: int = 1_000
     target_reversion_fraction: float = 0.70
@@ -48,20 +49,25 @@ class BacktestConfig:
     cooldown_ms: int = 10 * 60 * 1000
     fee_bps_per_side: float = 5.0
     slippage_bps_per_side: float = 1.0
+    minimum_edge_after_cost_bps: float = 2.0
     max_spread_bps: float = 12.0
 
 
 @dataclass
 class Candidate:
+    event_id: int
     trigger_index: int
     trigger_time_ms: int
     direction: int
     center: float
     initial_residual: float
+    trigger_spot_mid: float
+    trigger_futures_mid: float
 
 
 @dataclass
 class Position:
+    event_id: int
     direction: int
     entry_index: int
     entry_time_ms: int
@@ -73,6 +79,7 @@ class Position:
 
 @dataclass(frozen=True)
 class Trade:
+    event_id: int
     direction: str
     trigger_time_ms: int
     entry_time_ms: int
@@ -87,16 +94,36 @@ class Trade:
     exit_residual_bps: float
 
 
+@dataclass(frozen=True)
+class SignalMark:
+    event_id: int
+    timestamp_ms: int
+    mark: str
+    direction: str
+    reason: str
+    spot_mid: float
+    futures_mid: float
+    basis_bps: float
+    residual_bps: float
+
+
 @dataclass
 class BacktestResult:
     config: BacktestConfig
     trades: list[Trade]
+    signals: list[SignalMark]
     candidates_seen: int
     candidates_rejected_not_spot_led: int
     candidates_expired: int
 
     def summary(self) -> dict:
         returns = [trade.net_return for trade in self.trades]
+        marks_by_type: dict[str, int] = {}
+        rejections_by_reason: dict[str, int] = {}
+        for signal in self.signals:
+            marks_by_type[signal.mark] = marks_by_type.get(signal.mark, 0) + 1
+            if signal.mark == "rejected":
+                rejections_by_reason[signal.reason] = rejections_by_reason.get(signal.reason, 0) + 1
         wins = sum(value > 0 for value in returns)
         losses = sum(value <= 0 for value in returns)
         n = len(returns)
@@ -119,6 +146,10 @@ class BacktestResult:
             "candidates_seen": self.candidates_seen,
             "candidates_rejected_not_spot_led": self.candidates_rejected_not_spot_led,
             "candidates_expired": self.candidates_expired,
+            "signal_marks": len(self.signals),
+            "confirmed_signals": sum(signal.mark == "confirmed" for signal in self.signals),
+            "marks_by_type": marks_by_type,
+            "rejections_by_reason": rejections_by_reason,
         }
 
     def to_dict(self) -> dict:
@@ -126,10 +157,18 @@ class BacktestResult:
             "config": asdict(self.config),
             "summary": self.summary(),
             "trades": [asdict(trade) for trade in self.trades],
+            "signals": [asdict(signal) for signal in self.signals],
         }
 
     def write_json(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+    def write_signals_csv(self, path: str | Path) -> None:
+        fields = list(SignalMark.__dataclass_fields__)
+        with Path(path).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(asdict(signal) for signal in self.signals)
 
 
 class RollingBasis:
@@ -232,18 +271,51 @@ def historical_index_at_or_before(quotes: list[Quote], current_index: int, times
     return None
 
 
-def is_spot_led(quotes: list[Quote], index: int, direction: int, config: BacktestConfig) -> bool:
+def spot_lead_assessment(
+    quotes: list[Quote], index: int, direction: int, config: BacktestConfig
+) -> tuple[bool, str]:
     prior_index = historical_index_at_or_before(
         quotes, index - 1, quotes[index].timestamp_ms - config.move_lookback_ms
     )
     if prior_index is None:
-        return False
+        return False, "insufficient_move_history"
     spot_move = math.log(quotes[index].spot_mid / quotes[prior_index].spot_mid)
     futures_move = math.log(quotes[index].futures_mid / quotes[prior_index].futures_mid)
     minimum_move = config.minimum_spot_move_bps / 10_000.0
-    return (
-        direction * spot_move >= minimum_move
-        and direction * spot_move >= config.spot_lead_ratio * max(direction * futures_move, 0.0)
+    directed_spot_move = direction * spot_move
+    directed_futures_move = direction * futures_move
+    if directed_spot_move < minimum_move:
+        return False, "spot_move_below_minimum"
+    if directed_spot_move < config.spot_lead_ratio * max(directed_futures_move, 0.0):
+        return False, "spot_not_leading_futures"
+    return True, "spot_led_divergence"
+
+
+def direction_name(direction: int) -> str:
+    return "long" if direction > 0 else "short"
+
+
+def mark_signal(
+    signals: list[SignalMark],
+    event_id: int,
+    quote: Quote,
+    mark: str,
+    direction: int,
+    reason: str,
+    center: float,
+) -> None:
+    signals.append(
+        SignalMark(
+            event_id=event_id,
+            timestamp_ms=quote.timestamp_ms,
+            mark=mark,
+            direction=direction_name(direction),
+            reason=reason,
+            spot_mid=quote.spot_mid,
+            futures_mid=quote.futures_mid,
+            basis_bps=quote.basis * 10_000.0,
+            residual_bps=(quote.basis - center) * 10_000.0,
+        )
     )
 
 
@@ -255,11 +327,13 @@ def run_backtest(quotes: list[Quote], config: BacktestConfig | None = None) -> B
     candidate: Candidate | None = None
     position: Position | None = None
     trades: list[Trade] = []
+    signals: list[SignalMark] = []
     candidates_seen = 0
     rejected_not_spot_led = 0
     candidates_expired = 0
     cooldown_until = -1
     was_in_tail = False
+    next_event_id = 1
 
     for index, quote in enumerate(quotes):
         history.expire(quote.timestamp_ms)
@@ -294,6 +368,7 @@ def run_backtest(quotes: list[Quote], config: BacktestConfig | None = None) -> B
                 costs = 2.0 * (config.fee_bps_per_side + config.slippage_bps_per_side) / 10_000.0
                 trades.append(
                     Trade(
+                        event_id=position.event_id,
                         direction="long" if position.direction > 0 else "short",
                         trigger_time_ms=position.trigger_time_ms,
                         entry_time_ms=position.entry_time_ms,
@@ -308,6 +383,15 @@ def run_backtest(quotes: list[Quote], config: BacktestConfig | None = None) -> B
                         exit_residual_bps=position_residual * 10_000.0,
                     )
                 )
+                mark_signal(
+                    signals,
+                    position.event_id,
+                    quote,
+                    f"exit_{exit_reason}",
+                    position.direction,
+                    f"position_closed_by_{exit_reason}",
+                    position.center,
+                )
                 position = None
                 cooldown_until = quote.timestamp_ms + config.cooldown_ms
 
@@ -320,10 +404,47 @@ def run_backtest(quotes: list[Quote], config: BacktestConfig | None = None) -> B
                 <= abs(candidate.initial_residual) * (1.0 - config.confirmation_fraction)
                 and candidate_residual * candidate.initial_residual > 0
             )
+            closure = abs(candidate.initial_residual) - abs(candidate_residual)
+            futures_repair = candidate.direction * math.log(
+                quote.futures_mid / candidate.trigger_futures_mid
+            )
+            futures_repair_share = futures_repair / closure if closure > 0 else 0.0
             if expired or crossed_center:
                 candidates_expired += 1
+                mark_signal(
+                    signals,
+                    candidate.event_id,
+                    quote,
+                    "rejected",
+                    candidate.direction,
+                    "confirmation_timeout" if expired else "crossed_center_before_entry",
+                    candidate.center,
+                )
+                candidate = None
+            elif confirmed and (
+                futures_repair <= 0 or futures_repair_share < config.minimum_futures_repair_share
+            ):
+                candidates_expired += 1
+                mark_signal(
+                    signals,
+                    candidate.event_id,
+                    quote,
+                    "rejected",
+                    candidate.direction,
+                    "convergence_not_repaired_by_futures",
+                    candidate.center,
+                )
                 candidate = None
             elif confirmed:
+                mark_signal(
+                    signals,
+                    candidate.event_id,
+                    quote,
+                    "confirmed",
+                    candidate.direction,
+                    "futures_started_closing_divergence",
+                    candidate.center,
+                )
                 entry_index = price_at_or_after(
                     quotes, index, quote.timestamp_ms + config.entry_latency_ms
                 )
@@ -332,14 +453,55 @@ def run_backtest(quotes: list[Quote], config: BacktestConfig | None = None) -> B
                     direction = candidate.direction
                     entry_price = entry_quote.futures_ask if direction > 0 else entry_quote.futures_bid
                     entry_residual = entry_quote.basis - candidate.center
-                    position = Position(
-                        direction=direction,
-                        entry_index=entry_index,
-                        entry_time_ms=entry_quote.timestamp_ms,
-                        entry_price=entry_price,
-                        center=candidate.center,
-                        entry_residual=entry_residual,
-                        trigger_time_ms=candidate.trigger_time_ms,
+                    expected_reversion_bps = (
+                        abs(entry_residual) * config.target_reversion_fraction * 10_000.0
+                    )
+                    required_edge_bps = (
+                        2.0 * (config.fee_bps_per_side + config.slippage_bps_per_side)
+                        + config.minimum_edge_after_cost_bps
+                    )
+                    if (
+                        entry_residual * candidate.initial_residual <= 0
+                        or expected_reversion_bps <= required_edge_bps
+                    ):
+                        mark_signal(
+                            signals,
+                            candidate.event_id,
+                            entry_quote,
+                            "rejected",
+                            direction,
+                            "insufficient_remaining_edge_after_costs",
+                            candidate.center,
+                        )
+                    else:
+                        position = Position(
+                            event_id=candidate.event_id,
+                            direction=direction,
+                            entry_index=entry_index,
+                            entry_time_ms=entry_quote.timestamp_ms,
+                            entry_price=entry_price,
+                            center=candidate.center,
+                            entry_residual=entry_residual,
+                            trigger_time_ms=candidate.trigger_time_ms,
+                        )
+                        mark_signal(
+                            signals,
+                            candidate.event_id,
+                            entry_quote,
+                            "entry",
+                            direction,
+                            "entered_after_latency_with_positive_expected_edge",
+                            candidate.center,
+                        )
+                else:
+                    mark_signal(
+                        signals,
+                        candidate.event_id,
+                        quote,
+                        "rejected",
+                        candidate.direction,
+                        "no_quote_after_entry_latency",
+                        candidate.center,
                     )
                 candidate = None
 
@@ -347,34 +509,69 @@ def run_backtest(quotes: list[Quote], config: BacktestConfig | None = None) -> B
             spread_bps(quote.spot_bid, quote.spot_ask) <= config.max_spread_bps
             and spread_bps(quote.futures_bid, quote.futures_ask) <= config.max_spread_bps
         )
+        tail_started = in_tail and not was_in_tail
         if (
             position is None
             and candidate is None
             and quote.timestamp_ms >= cooldown_until
-            and in_tail
-            and not was_in_tail
-            and spreads_ok
+            and tail_started
         ):
+            event_id = next_event_id
+            next_event_id += 1
             candidates_seen += 1
             # Positive residual means futures is expensive, so trade futures short.
             direction = -1 if residual > 0 else 1
-            if is_spot_led(quotes, index, direction, config):
-                candidate = Candidate(
-                    trigger_index=index,
-                    trigger_time_ms=quote.timestamp_ms,
-                    direction=direction,
-                    center=center,
-                    initial_residual=residual,
+            mark_signal(signals, event_id, quote, "detected", direction, "basis_entered_historical_tail", center)
+            if not spreads_ok:
+                mark_signal(
+                    signals, event_id, quote, "rejected", direction, "quoted_spread_above_limit", center
                 )
             else:
-                rejected_not_spot_led += 1
+                spot_led, reason = spot_lead_assessment(quotes, index, direction, config)
+                if spot_led:
+                    candidate = Candidate(
+                        event_id=event_id,
+                        trigger_index=index,
+                        trigger_time_ms=quote.timestamp_ms,
+                        direction=direction,
+                        center=center,
+                        initial_residual=residual,
+                        trigger_spot_mid=quote.spot_mid,
+                        trigger_futures_mid=quote.futures_mid,
+                    )
+                    mark_signal(signals, event_id, quote, "candidate", direction, reason, center)
+                else:
+                    rejected_not_spot_led += 1
+                    mark_signal(signals, event_id, quote, "rejected", direction, reason, center)
 
         history.append(quote.timestamp_ms, quote.basis)
         was_in_tail = in_tail
 
+    if candidate is not None and quotes:
+        mark_signal(
+            signals,
+            candidate.event_id,
+            quotes[-1],
+            "rejected",
+            candidate.direction,
+            "end_of_data_before_confirmation",
+            candidate.center,
+        )
+    if position is not None and quotes:
+        mark_signal(
+            signals,
+            position.event_id,
+            quotes[-1],
+            "open_end_of_data",
+            position.direction,
+            "position_remained_open_at_end_of_data",
+            position.center,
+        )
+
     return BacktestResult(
         config=config,
         trades=trades,
+        signals=signals,
         candidates_seen=candidates_seen,
         candidates_rejected_not_spot_led=rejected_not_spot_led,
         candidates_expired=candidates_expired,

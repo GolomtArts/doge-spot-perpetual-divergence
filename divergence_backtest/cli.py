@@ -10,6 +10,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Backtest spot/perpetual divergence events")
     result.add_argument("csv", help="Synchronized BBO CSV")
     result.add_argument("--report", help="Write full JSON report")
+    result.add_argument("--signals", help="Write every detected/rejected/confirmed signal mark to CSV")
     result.add_argument("--tail-quantile", type=float, default=0.999)
     result.add_argument("--minimum-history", type=int, default=1_000)
     result.add_argument("--entry-latency-ms", type=int, default=1_000)
@@ -32,9 +33,10 @@ def main() -> None:
     result = run_backtest(load_quotes(args.csv), config)
     if args.report:
         result.write_json(args.report)
+    if args.signals:
+        result.write_signals_csv(args.signals)
     print(json.dumps(result.summary(), indent=2))
 
 
 if __name__ == "__main__":
     main()
-

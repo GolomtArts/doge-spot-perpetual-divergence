@@ -7,6 +7,6 @@ work/*
 !work/.gitkeep
 
 outputs/*.json
+outputs/*.csv
 !outputs/.gitkeep
 !outputs/research-protocol.md
-
