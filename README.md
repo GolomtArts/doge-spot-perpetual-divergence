@@ -64,8 +64,13 @@ Backtest collected data:
 ```bash
 python3 -m divergence_backtest.cli work/binance-dogeusdt-bbo.csv \
   --report outputs/binance-backtest-report.json \
-  --signals outputs/binance-signal-marks.csv
+  --signals outputs/binance-signal-marks.csv \
+  --chart outputs/binance-signal-chart.html
 ```
+
+Open the generated HTML chart in any browser to inspect Spot, Futures, and every
+signal marker. Hover over a marker to see its `event_id`, direction, basis,
+residual, and acceptance or rejection reason.
 
 Every independent tail event receives an `event_id`. The signal CSV records its
 full lifecycle:

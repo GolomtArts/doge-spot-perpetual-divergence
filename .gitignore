@@ -8,5 +8,6 @@ work/*
 
 outputs/*.json
 outputs/*.csv
+outputs/*.html
 !outputs/.gitkeep
 !outputs/research-protocol.md

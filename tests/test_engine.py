@@ -11,6 +11,7 @@ from divergence_backtest.engine import (
     wilson_interval,
 )
 from divergence_backtest.synthetic import generate
+from divergence_backtest.visualize import write_signal_chart
 
 
 class EngineTests(unittest.TestCase):
@@ -67,6 +68,12 @@ class EngineTests(unittest.TestCase):
             exported = signals_path.read_text(encoding="utf-8")
             self.assertIn("event_id,timestamp_ms,mark,direction,reason", exported)
             self.assertIn("confirmed", exported)
+
+            chart_path = Path(directory) / "signals.html"
+            write_signal_chart(quotes, result, chart_path)
+            chart = chart_path.read_text(encoding="utf-8")
+            self.assertIn("DOGEUSDT Spot / Futures Signal Marks", chart)
+            self.assertIn('"mark":"confirmed"', chart)
 
     def test_unprofitable_confirmed_signal_is_marked_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

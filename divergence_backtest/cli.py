@@ -4,6 +4,7 @@ import argparse
 import json
 
 from .engine import BacktestConfig, load_quotes, run_backtest
+from .visualize import write_signal_chart
 
 
 def parser() -> argparse.ArgumentParser:
@@ -11,6 +12,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("csv", help="Synchronized BBO CSV")
     result.add_argument("--report", help="Write full JSON report")
     result.add_argument("--signals", help="Write every detected/rejected/confirmed signal mark to CSV")
+    result.add_argument("--chart", help="Write an HTML price chart with signal markers")
     result.add_argument("--tail-quantile", type=float, default=0.999)
     result.add_argument("--minimum-history", type=int, default=1_000)
     result.add_argument("--entry-latency-ms", type=int, default=1_000)
@@ -30,11 +32,14 @@ def main() -> None:
         fee_bps_per_side=args.fee_bps,
         slippage_bps_per_side=args.slippage_bps,
     )
-    result = run_backtest(load_quotes(args.csv), config)
+    quotes = load_quotes(args.csv)
+    result = run_backtest(quotes, config)
     if args.report:
         result.write_json(args.report)
     if args.signals:
         result.write_signals_csv(args.signals)
+    if args.chart:
+        write_signal_chart(quotes, result, args.chart)
     print(json.dumps(result.summary(), indent=2))
 
 
