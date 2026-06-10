@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.py[cod]
+.DS_Store
+
+work/*
+!work/.gitkeep
+
+outputs/*.json
+!outputs/.gitkeep
+!outputs/research-protocol.md
+
